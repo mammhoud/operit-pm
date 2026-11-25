@@ -1,0 +1,404 @@
+import { observer } from 'mobx-react-lite';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Switch } from '@/components/ui/switch';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { api } from '@/lib/trpc';
+import { PromiseCall } from '@/store/standard/PromiseState';
+import { Icon } from '@/components/Common/Iconify/icons';
+import { CollapsibleCard } from '../Common/CollapsibleCard';
+import { showTipsDialog } from '@/components/Common/TipsDialog';
+import { LoadingAndEmpty } from '@/components/Common/LoadingAndEmpty';
+import { RootStore } from '@/store';
+import { PlanIncStore } from '@/store/planincStore';
+import { ToastPlugin } from '@/store/module/Toast/Toast';
+import { CATEGORY_COLOR_PRESETS as COLOR_PRESETS } from '@/lib/colorSeries';
+
+const ICON_PRESETS = [
+  'tabler:list-check',
+  'tabler:target-arrow',
+  'tabler:flag',
+  'tabler:sparkles',
+  'tabler:clock-hour-4',
+  'tabler:book',
+  'tabler:rocket',
+  'tabler:folder',
+];
+
+type PlanCategory = {
+  id: number;
+  name: string;
+  slug: string;
+  color: string;
+  icon: string;
+  isDefault: boolean;
+  enabled: boolean;
+  sortOrder: number;
+};
+
+const emptyDraft = {
+  id: null as number | null,
+  name: '',
+  slug: '',
+  color: COLOR_PRESETS[0].value,
+  icon: ICON_PRESETS[0],
+  isDefault: false,
+  enabled: true,
+};
+
+/**
+ * Agenda lanes (plan categories).
+ *
+ * Lanes are unique per account (enforced by their slug) and feed the Agenda
+ * board columns, the directory filter, and the lane picker in the CRUD modal.
+ * New plans land in the default lane automatically. Editing here never breaks
+ * existing plans: renaming keeps the slug, and deleting moves affected plans
+ * to a replacement lane (or uncategorised).
+ */
+export const CategorySetting = observer(() => {
+  const { t } = useTranslation();
+  const planinc = RootStore.Get(PlanIncStore);
+  const [categories, setCategories] = useState<PlanCategory[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isOpen, setIsOpen] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [draft, setDraft] = useState({ ...emptyDraft });
+  const [error, setError] = useState('');
+
+  const load = async () => {
+    setIsLoading(true);
+    try {
+      setCategories(await api.planningCategories.list.query({ includeDisabled: true }) as PlanCategory[]);
+      setError('');
+    } catch (cause) {
+      console.error('Failed to load plan categories', cause);
+      setError((cause as Error)?.message ?? t('operation-failed'));
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => { void load(); }, []);
+
+  const openCreate = () => {
+    setDraft({ ...emptyDraft, isDefault: categories.length === 0 });
+    setError('');
+    setIsOpen(true);
+  };
+
+  const openEdit = (category: PlanCategory) => {
+    setDraft({
+      id: category.id,
+      name: category.name,
+      slug: category.slug,
+      color: category.color,
+      icon: category.icon,
+      isDefault: category.isDefault,
+      enabled: category.enabled,
+    });
+    setError('');
+    setIsOpen(true);
+  };
+
+  const save = async () => {
+    if (!draft.name.trim() || isSaving) return;
+    const payload = {
+      name: draft.name.trim(),
+      color: draft.color,
+      icon: draft.icon,
+      isDefault: draft.isDefault,
+      enabled: draft.enabled,
+    };
+    setIsSaving(true);
+    try {
+      if (draft.id == null) await api.planningCategories.create.mutate(payload);
+      else await api.planningCategories.update.mutate({ id: draft.id, ...payload });
+      setIsOpen(false);
+      await load();
+    } catch (cause) {
+      console.error('Failed to save plan category', cause);
+      setError((cause as Error)?.message ?? t('operation-failed'));
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const nameKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (draft.name.trim() && !isSaving) void save();
+    }
+  };
+
+  const remove = (category: PlanCategory) => {
+    showTipsDialog({
+      title: t('confirm-to-delete'),
+      content: t('category-delete-warning', { name: category.name }),
+      onConfirm: async () => {
+        await PromiseCall(api.planningCategories.delete.mutate({ id: category.id, reassignToId: null }));
+        await load();
+      },
+    });
+  };
+
+  const move = async (category: PlanCategory, direction: -1 | 1) => {
+    const index = categories.findIndex((item) => item.id === category.id);
+    const target = index + direction;
+    if (index === -1 || target < 0 || target >= categories.length) return;
+    const next = [...categories];
+    [next[index], next[target]] = [next[target], next[index]];
+    setCategories(next);
+    try {
+      await api.planningCategories.reorder.mutate({ orderedIds: next.map((item) => item.id) });
+    } catch (cause) {
+      console.error('Failed to reorder plan categories', cause);
+      RootStore.Get(ToastPlugin).error((cause as Error)?.message ?? t('operation-failed'));
+      await load();
+    }
+  };
+
+  const toggleEnabled = async (category: PlanCategory, enabled: boolean) => {
+    setCategories((current) => current.map((item) => (item.id === category.id ? { ...item, enabled } : item)));
+    await PromiseCall(api.planningCategories.update.mutate({ id: category.id, enabled }), { autoAlert: false });
+  };
+
+  const seedDefaults = async () => {
+    await PromiseCall(api.planningCategories.seedDefaults.mutate({}), { autoAlert: false });
+    await load();
+  };
+
+  const defaultCategory = categories.find((category) => category.isDefault) ?? null;
+
+  /** Point the "new plans land here" lane at another category (or none). */
+  const setDefaultLane = async (id: number | null) => {
+    try {
+      if (defaultCategory && defaultCategory.id !== id) {
+        await api.planningCategories.update.mutate({ id: defaultCategory.id, isDefault: false });
+      }
+      if (id != null && defaultCategory?.id !== id) {
+        await api.planningCategories.update.mutate({ id, isDefault: true });
+      }
+      setError('');
+      await load();
+    } catch (cause) {
+      console.error('Failed to set default agenda lane', cause);
+      setError((cause as Error)?.message ?? t('operation-failed'));
+    }
+  };
+
+  const persistAgendaPref = async (key: 'agendaShowCompleted' | 'agendaShowUncategorised', value: boolean) => {
+    await PromiseCall(api.config.update.mutate({ key, value }), { autoAlert: false });
+    await planinc.config.call();
+  };
+
+  const showCompleted = planinc.config.value?.agendaShowCompleted ?? false;
+  const showUncategorised = planinc.config.value?.agendaShowUncategorised ?? true;
+
+  return (
+    <CollapsibleCard icon="solar:calendar-mark-linear" title={t('agenda-lanes')}>
+      <div className="flex flex-col gap-3 p-1">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="min-w-0 flex-1">
+            <p className="text-sm text-default-500">{t('agenda-lanes-description')}</p>
+            <p className="mt-1 text-xs text-muted-foreground">{t('done-status-hint')}</p>
+          </div>
+          <div className="flex gap-2">
+            {!categories.length && (
+              <Button size="sm" variant="ghost" onClick={seedDefaults}><Icon icon="tabler:sparkles" width="16" height="16" />
+                {t('seed-default-categories')}
+              </Button>
+            )}
+            <Button size="sm" onClick={openCreate}><Icon icon="material-symbols:add" width="16" height="16" />
+              {t('add-category')}
+            </Button>
+          </div>
+        </div>
+
+        {(isLoading || (!isLoading && !categories.length)) && (
+          <LoadingAndEmpty
+            isLoading={isLoading}
+            isEmpty={!isLoading && !categories.length}
+            emptyMessage={t('no-categories')}
+            isAbsolute={false}
+            className="py-2"
+          />
+        )}
+
+        {!isLoading && categories.map((category, index) => (
+          <div key={category.id} className="flex flex-wrap items-center gap-2 rounded-xl bg-default-100/60 p-3">
+            <span
+              className="flex h-11 w-11 sm:h-8 sm:w-8 shrink-0 items-center justify-center rounded-lg text-white"
+              style={{ backgroundColor: category.color }}
+            >
+              <Icon icon={category.icon} width="17" height="17" className="text-white" />
+            </span>
+            <div className="min-w-[150px] flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm font-medium">{category.name}</span>
+                {category.isDefault && <Badge variant="default">{t('default')}</Badge>}
+                {!category.enabled && <Badge variant="warning">{t('disabled')}</Badge>}
+              </div>
+              <p className="text-xs text-default-400">{category.slug} · {category.color}</p>
+            </div>
+
+            <div className="flex items-center gap-1 ml-auto">
+              <Button size="icon" className="min-h-[44px] min-w-[44px]" variant="ghost" disabled={index === 0} aria-label={t('move-up')} onClick={() => move(category, -1)}>
+                <Icon icon="mdi:arrow-up" width="16" height="16" />
+              </Button>
+              <Button size="icon" className="min-h-[44px] min-w-[44px]" variant="ghost" disabled={index === categories.length - 1} aria-label={t('move-down')} onClick={() => move(category, 1)}>
+                <Icon icon="mdi:arrow-down" width="16" height="16" />
+              </Button>
+            </div>
+
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex">
+                  <Switch checked={category.enabled} onCheckedChange={(next) => toggleEnabled(category, next)} aria-label={category.name} />
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>{category.enabled ? t('disable') : t('enable')}</TooltipContent>
+            </Tooltip>
+            <Button size="icon" className="min-h-[44px] min-w-[44px]" variant="ghost" aria-label={t('edit')} onClick={() => openEdit(category)}>
+              <Icon icon="hugeicons:edit-02" width="16" height="16" />
+            </Button>
+            <Button size="icon" className="min-h-[44px] min-w-[44px]" variant="destructive" aria-label={t('delete')} onClick={() => remove(category)}>
+              <Icon icon="hugeicons:delete-02" width="16" height="16" />
+            </Button>
+          </div>
+        ))}
+
+        <div className="mt-1 flex flex-col gap-2 border-t border-divider pt-3">
+          <p className="text-sm font-semibold">{t('agenda-preferences')}</p>
+
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-default-100/60 px-3 py-2">
+            <div className="min-w-[150px] flex-1">
+              <p className="text-sm">{t('agenda-default-lane')}</p>
+              <p className="text-xs text-default-400">{t('agenda-default-lane-hint')}</p>
+            </div>
+            <Select
+              value={defaultCategory ? String(defaultCategory.id) : 'none'}
+              onValueChange={(value) => void setDefaultLane(value === 'none' ? null : Number(value))}
+            >
+              <SelectTrigger className="w-[200px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">{t('agenda-default-lane-none')}</SelectItem>
+                {categories.map((category) => (
+                  <SelectItem key={category.id} value={String(category.id)}>
+                    <span className="flex items-center gap-2">
+                      <Icon icon={category.icon} width="14" height="14" />
+                      {category.name}
+                    </span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="flex items-center justify-between gap-2 rounded-xl bg-default-100/60 px-3 py-2">
+            <div className="min-w-[150px] flex-1">
+              <p className="text-sm">{t('show-completed')}</p>
+              <p className="text-xs text-default-400">{t('agenda-show-completed-hint')}</p>
+            </div>
+            <Switch checked={showCompleted} onCheckedChange={(next) => void persistAgendaPref('agendaShowCompleted', next)} aria-label={t('show-completed')} />
+          </div>
+
+          <div className="flex items-center justify-between gap-2 rounded-xl bg-default-100/60 px-3 py-2">
+            <div className="min-w-[150px] flex-1">
+              <p className="text-sm">{t('agenda-show-uncategorised')}</p>
+              <p className="text-xs text-default-400">{t('agenda-show-uncategorised-hint')}</p>
+            </div>
+            <Switch checked={showUncategorised} onCheckedChange={(next) => void persistAgendaPref('agendaShowUncategorised', next)} aria-label={t('agenda-show-uncategorised')} />
+          </div>
+        </div>
+      </div>
+
+      <Dialog open={isOpen} onOpenChange={(open) => { if (!open && !isSaving) setIsOpen(false); }}>
+        <DialogContent className="w-[calc(100vw-2rem)] sm:max-w-lg max-h-[90dvh] overflow-y-auto" onPointerDownOutside={(e) => { if (isSaving) e.preventDefault(); }}>
+          <DialogHeader><DialogTitle>{draft.id == null ? t('add-category') : t('edit-category')}</DialogTitle></DialogHeader>
+          <div className="flex flex-col gap-3">
+            <div className="space-y-1.5">
+              <Label>{t('category-name')}</Label>
+              <Input
+                autoFocus
+                value={draft.name}
+                onChange={(e) => setDraft((current) => ({ ...current, name: e.target.value }))}
+                onKeyDown={nameKeyDown}
+                disabled={isSaving}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label>{t('category-slug')}</Label>
+              <Input
+                value={draft.slug}
+                readOnly={draft.id != null}
+                onChange={(e) => setDraft((current) => ({ ...current, slug: e.target.value }))}
+              />
+              <p className="text-xs text-muted-foreground">{t('category-slug-description')}</p>
+            </div>
+            <div>
+              <p className="mb-2 text-sm text-default-500">{t('category-color')}</p>
+              <div className="flex flex-wrap gap-2">
+                {COLOR_PRESETS.map((preset) => (
+                  <button
+                    key={preset.key}
+                    type="button"
+                    aria-label={preset.key}
+                    aria-pressed={draft.color === preset.value}
+                    onClick={() => setDraft((current) => ({ ...current, color: preset.value }))}
+                    className={`h-11 w-11 sm:h-8 sm:w-8 rounded-lg border-2 ${draft.color === preset.value ? 'border-foreground' : 'border-transparent'}`}
+                    style={{ backgroundColor: preset.value }}
+                  />
+                ))}
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <Label>{t('category-icon')}</Label>
+              <Select
+                value={draft.icon}
+                onValueChange={(value) => setDraft((current) => ({ ...current, icon: value }))}
+              >
+                <SelectTrigger>
+                  <span className="flex items-center gap-2">
+                    <Icon icon={draft.icon} width="16" height="16" />
+                    {draft.icon}
+                  </span>
+                </SelectTrigger>
+                <SelectContent>
+                  {ICON_PRESETS.map((icon) => (
+                    <SelectItem key={icon} value={icon}>
+                      <span className="flex items-center gap-2">
+                        <Icon icon={icon} width="16" height="16" />
+                        {icon}
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex items-center justify-between rounded-xl bg-default-100/60 px-3 py-2">
+              <span className="text-sm">{t('set-as-default')}</span>
+              <Switch checked={draft.isDefault} onCheckedChange={(value) => setDraft((current) => ({ ...current, isDefault: value }))} />
+            </div>
+            <div className="flex items-center justify-between rounded-xl bg-default-100/60 px-3 py-2">
+              <span className="text-sm">{t('enabled')}</span>
+              <Switch checked={draft.enabled} onCheckedChange={(value) => setDraft((current) => ({ ...current, enabled: value }))} />
+            </div>
+            {error && <p className="rounded-xl bg-destructive/10 p-3 text-sm text-destructive">{error}</p>}
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setIsOpen(false)} disabled={isSaving}>{t('cancel')}</Button>
+            <Button disabled={!draft.name.trim() || isSaving} loading={isSaving} onClick={save}>{t('save')}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </CollapsibleCard>
+  );
+});

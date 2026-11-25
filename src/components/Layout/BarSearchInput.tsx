@@ -1,0 +1,108 @@
+import React, { useEffect, useState } from 'react';
+import { Button } from '@/components/ui/button';
+import { Icon } from '@/components/Common/Iconify/icons';
+import { motion } from 'framer-motion';
+import { useTranslation } from 'react-i18next';
+import { RootStore } from '@/store';
+import { PlanIncStore } from '@/store/planincStore';
+import { observer } from 'mobx-react-lite';
+import { eventBus } from '@/lib/event';
+import { GlobalSearch } from './GlobalSearch';
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+import { clearSearchState, getSearchWithClearedFilters } from '@/lib/searchFilters';
+import { OPEN_GLOBAL_SEARCH_EVENT } from './CommandPalette';
+
+interface BarSearchInputProps {
+  isPc: boolean;
+}
+
+export const BarSearchInput = observer(({ isPc }: BarSearchInputProps) => {
+  const { t } = useTranslation();
+  const planincStore = RootStore.Get(PlanIncStore);
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [searchParams] = useSearchParams();
+  const [showSearchInput, setShowSearchInput] = useState(false);
+  const [isGlobalSearchOpen, setIsGlobalSearchOpen] = useState(false);
+  const [localSearchText, setLocalSearchText] = useState('');
+
+  // The Cmd/Ctrl+K chord belongs to the command palette (CommonLayout); this component
+  // only reacts to OPEN_GLOBAL_SEARCH_EVENT, which the palette's search action and the
+  // mobile search button both emit.
+  useEffect(() => {
+    eventBus.on(OPEN_GLOBAL_SEARCH_EVENT, () => {
+      setIsGlobalSearchOpen(true);
+    });
+
+    // Sync with planincStore.searchText
+    setLocalSearchText(planincStore.searchText || '');
+  }, [planincStore.searchText]);
+
+  // Check if there are any active filters
+  const hasActiveFilters = () => {
+    const config = planincStore.noteListFilterConfig;
+    return !!(
+      localSearchText ||
+      config.tagId !== null ||
+      config.withoutTag ||
+      config.withFile ||
+      config.withLink ||
+      config.isShare !== null ||
+      config.hasTodo ||
+      config.startDate !== null ||
+      config.endDate !== null ||
+      config.type !== 0
+    );
+  };
+
+  const handleGlobalSearch = () => {
+    // Emit an event that will be caught by the CommonLayout to open the global search
+    eventBus.emit(OPEN_GLOBAL_SEARCH_EVENT);
+  };
+
+  const handleClearSearch = (e: React.MouseEvent) => {
+    e.stopPropagation();
+
+    setLocalSearchText('');
+    clearSearchState(planincStore);
+
+    navigate({
+      pathname: location.pathname,
+      search: getSearchWithClearedFilters(searchParams),
+    });
+
+    // Focus back on the search input after clearing
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+  };
+
+  return (
+    <>
+      <GlobalSearch isOpen={isGlobalSearchOpen} onOpenChange={setIsGlobalSearchOpen} />
+      {!isPc && !showSearchInput ? (
+        <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} transition={{ duration: 0.2 }}>
+          <Button size="icon-sm" variant="ghost" className="ml-auto mt-[2px]" onClick={() => handleGlobalSearch()}>
+            <Icon className="text-default-600" icon="lets-icons:search" width="24" height="24" />
+          </Button>
+        </motion.div>
+      ) : (
+        <div className="hidden md:flex items-center relative">
+          <Button size="sm" variant="ghost" onClick={() => setIsGlobalSearchOpen(true)} className={`${!hasActiveFilters() ? 'w-[170px]' : 'w-auto min-w-[120px] max-w-[250px]'} justify-center flex gap-1 px-3 border-2 border-desc`}>
+            <Icon className="text-default-500 mr-1" icon="lets-icons:search" width="16" height="16" />
+            <span className={`${localSearchText.length > 0 ? 'text-primary-foreground bg-primary rounded-md px-2' : 'text-default-500'} truncate mr-auto`}>{localSearchText.length > 0 ? localSearchText : t('search')}</span>
+            {localSearchText && <Icon icon="ph:x-bold" width="14" height="14" className="ml-1 p-0 hover:text-danger transition-colors" onClick={handleClearSearch} />}
+
+            {!localSearchText && (
+              <div className="flex items-center gap-1 ml-2">
+                <kbd className="px-1.5 py-0.5 bg-default-100 rounded text-default-600 text-xs">Ctrl</kbd>
+                <span className="text-default-600">+</span>
+                <kbd className="px-1.5 py-0.5 bg-default-100 rounded text-default-600 text-xs">K</kbd>
+              </div>
+            )}
+          </Button>
+        </div>
+      )}
+    </>
+  );
+});

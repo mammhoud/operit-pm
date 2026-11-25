@@ -1,0 +1,88 @@
+# PlanInc local-only ignore
+
+# Runtime data (databases, uploads — local only)
+planinc-data/
+data/planinc.db/
+data/superuser.txt
+superuser.txt
+**/superuser.txt
+server/data/planinc.db/
+django_server/data/
+
+# Env files
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Logs
+*.log
+logs/
+appmap.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Caches/build
+.turbo/
+.cache/
+.parcel-cache/
+.next/
+.nuxt/
+coverage/
+.tmp/
+temp/
+
+# Python deps and build artifacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node dependencies
+node_modules/
+bun.lockb
+pnpm-lock.yaml
+yarn.lock
+
+# Build output
+dist/
+build/
+out/
+frontend/dist/
+server/dist/
+e2e/.artifacts/
+
+# Tauri / Rust build artifacts
+frontend/src-tauri/target/
+src-tauri/target/
+
+# TypeScript probe configs (dev-only)
+tsconfig.probe*.json
+tsconfig.r_*.json
+
+# Temporary probe dirs
+server/__tsprobe__/
+
+# PlanInc global
+.planinc/
+
+# Local agent/runtime artifacts
+.claude/
+.cursor/
+.wrangler/

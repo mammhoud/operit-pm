@@ -1,0 +1,549 @@
+import express from 'express';
+import cors from 'cors';
+import path from 'path';
+import crypto from 'crypto';
+import zlib from 'zlib';
+import fs from 'fs';
+import authRoutes from './routerExpress/auth';
+import { configureSession } from './routerExpress/auth/config';
+
+// job queue job scheduling
+import { getJobQueue, stopJobQueue } from './lib/jobQueue';
+import { ArchiveJob } from './jobs/archivejob';
+import { DBJob } from './jobs/dbjob';
+import { RebuildEmbeddingJob } from './jobs/rebuildEmbeddingJob';
+import { RecommandJob } from './jobs/recommandJob';
+import { AIScheduledTaskJob } from './jobs/aiScheduledTaskJob';
+
+// tRPC related imports
+import { createContext } from './context';
+import { appRouter } from './routerTrpc/_app';
+import { createExpressMiddleware } from '@trpc/server/adapters/express';
+import { createOpenApiExpressMiddleware } from 'trpc-to-openapi';
+import { ensureSurrealSchema } from './db';
+import { createSeed } from './seedData';
+import { hashPassword } from './lib/password';
+
+// API documentation
+import swaggerUi from 'swagger-ui-express';
+import { openApiDocument } from './swagger';
+
+// Express router imports
+import fileRouter from './routerExpress/file/file';
+import uploadRouter from './routerExpress/file/upload';
+import uploadByUrlRouter from './routerExpress/file/upload-by-url';
+import deleteRouter from './routerExpress/file/delete';
+import s3fileRouter from './routerExpress/file/s3file';
+import pluginRouter from './routerExpress/file/plugin';
+import archiveRouter from './routerExpress/file/archive';
+import rssRouter from './routerExpress/rss';
+import openaiRouter from './routerExpress/openai';
+import mcpRouter from './routerExpress/mcp';
+import syncRouter from './routerExpress/sync';
+
+// Vite integration
+import ViteExpress from 'vite-express';
+
+// Process error handling
+process.on('uncaughtException', (error) => {
+  console.error('uncaughtException:', error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('unhandledRejection:', reason);
+});
+
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received, shutting down gracefully...');
+  await stopJobQueue();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('SIGINT received, shutting down gracefully...');
+  await stopJobQueue();
+  process.exit(0);
+});
+
+process.on('exit', (code) => {
+  console.log(`process exit, code: ${code}`);
+});
+
+/**
+ * Initialize all scheduled jobs
+ * This sets up job queue and registers all job workers
+ */
+async function initializeJobs() {
+  try {
+    console.log('Initializing job queue scheduled jobs...');
+    
+    // Start job queue
+    await getJobQueue();
+    
+    // Initialize all jobs
+    // These will restore their schedules from the database if they were running
+    await ArchiveJob.initialize();
+    await DBJob.initialize();
+    await RebuildEmbeddingJob.initialize();
+    await RecommandJob.initialize();
+    await AIScheduledTaskJob.initialize();
+    
+    console.log('All scheduled jobs initialized successfully');
+  } catch (error) {
+    console.error('Failed to initialize scheduled jobs:', error);
+    // Don't throw - allow server to start even if jobs fail to initialize
+  }
+}
+
+// Server configuration
+const app = express();
+// PLANINC_PORT lets a dev instance run beside anything already bound to the
+// default 1111 (e.g. an IDE utility process squatting the port).
+const PORT = Number(process.env.PLANINC_PORT) || 1111;
+const appRootDev = path.resolve(__dirname, '../src');
+const appRootProd = path.resolve(__dirname, '../server');
+const corsOrigins = new Set(
+  String(process.env.PLANINC_CORS_ORIGINS || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+);
+for (const origin of ['tauri://localhost', 'http://tauri.localhost', 'https://tauri.localhost']) {
+  corsOrigins.add(origin);
+}
+const isDevelopmentLoopbackOrigin = (origin: string) => {
+  if (process.env.NODE_ENV === 'production') return false;
+
+  try {
+    const url = new URL(origin);
+    const port = url.port || (url.protocol === 'https:' ? '443' : '80');
+    return (
+      ['localhost', '127.0.0.1', '0.0.0.0'].includes(url.hostname) &&
+      port === String(PORT)
+    );
+  } catch {
+    return false;
+  }
+};
+let server: any = null;
+
+if (process.env.NODE_ENV === 'production') {
+  // Vite configuration
+  ViteExpress.config({
+    mode: 'production',
+    inlineViteConfig: {
+      //docker production dir /dist not development dir
+      root: appRootProd,
+      build: { outDir: "public" }
+    }
+  });
+} else {
+  ViteExpress.config({
+    viteConfigFile: path.resolve(appRootDev, 'vite.config.ts'),
+    inlineViteConfig: {
+      root: appRootDev,
+    }
+  });
+}
+
+// Global error handler
+const errorHandler = (err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error('express error:', err);
+  res.status(500).json({
+    error: {
+      message: 'Internal Server Error',
+      ...(process.env.NODE_ENV !== 'production' ? { details: err.message, stack: err.stack } : {})
+    }
+  });
+};
+
+/**
+ * Setup all API routes for the application
+ */
+async function setupApiRoutes(app: express.Application) {
+  // Authentication routes
+  app.use('/api/auth', authRoutes);
+
+  // tRPC endpoint with adapter for Express
+  app.use('/api/trpc',
+    createExpressMiddleware({
+      router: appRouter,
+      createContext: ({ req, res }) => {
+        return createContext(req, res);
+      },
+      onError: ({ error, path }) => {
+        // Expected client errors (logged-out visitors, expired sessions, bots
+        // probing auth-gated procedures) are routine — log one line without a
+        // stack trace so production logs stay readable. Full details are kept
+        // for genuine server failures.
+        const clientCodes = new Set([
+          'UNAUTHORIZED',
+          'FORBIDDEN',
+          'NOT_FOUND',
+          'BAD_REQUEST',
+          'CONFLICT',
+          'PRECONDITION_FAILED',
+          'TOO_MANY_REQUESTS',
+        ]);
+        if (error.code === 'INTERNAL_SERVER_ERROR' || !clientCodes.has(error.code)) {
+          console.error(`tRPC error on "${path ?? 'unknown'}":`, error);
+        } else {
+          console.warn(`tRPC ${error.code} on "${path ?? 'unknown'}": ${error.message}`);
+        }
+      }
+    })
+  );
+
+  // File handling endpoints
+  app.use('/api/file/archive', archiveRouter);
+  app.use('/api/file', fileRouter);
+  app.use('/api/file/upload', uploadRouter);
+  app.use('/api/file/upload-by-url', uploadByUrlRouter);
+  app.use('/api/file/delete', deleteRouter);
+  app.use('/api/s3file', s3fileRouter);
+
+  // Postgres → Surreal sync ingest (Django outbox deliverables)
+  app.use('/api/sync', syncRouter);
+  
+  // Helper function to serve vditor dependencies with gzip compression
+  const serveVditorFile = (routePath: string, filePath: string) => {
+    app.use(routePath, (req, res) => {
+      const fullPath = path.resolve(__dirname, filePath);
+      
+      // Check if file exists
+      if (!fs.existsSync(fullPath)) {
+        res.status(404).send('File not found');
+        return;
+      }
+      
+      // Check if client accepts gzip encoding
+      const acceptEncoding = req.headers['accept-encoding'] || '';
+      const supportsGzip = acceptEncoding.includes('gzip');
+      
+      // Determine content type based on file extension
+      const contentType = filePath.endsWith('.css') 
+        ? 'text/css' 
+        : filePath.endsWith('.js') 
+        ? 'application/javascript'
+        : 'application/octet-stream';
+      
+      res.set({
+        'Cache-Control': 'public, max-age=604800, immutable',
+        'Expires': new Date(Date.now() + 604800000).toUTCString(),
+        'Content-Type': contentType
+      });
+      
+      // CSS files should not be gzipped (they're already minified)
+      // Only gzip JS files
+      if (supportsGzip && !filePath.endsWith('.css')) {
+        // Send gzip compressed version for JS files
+        res.set('Content-Encoding', 'gzip');
+        const readStream = fs.createReadStream(fullPath);
+        const gzipStream = zlib.createGzip({ level: 6 });
+        readStream.pipe(gzipStream).pipe(res);
+      } else {
+        // Send uncompressed version (for CSS or when gzip not supported)
+        res.sendFile(fullPath);
+      }
+    });
+  };
+
+  // Special handling for lute.min.js with gzip compression
+  serveVditorFile('/dist/js/lute/lute.min.js', './lute.min.js');
+  
+  app.use('/dist/js/icons/ant.js', (req, res) => {
+    res.set({
+      'Cache-Control': 'public, max-age=604800, immutable',
+      'Expires': new Date(Date.now() + 604800000).toUTCString()
+    });
+    res.sendFile(path.resolve(__dirname, './lute.min.js'));
+  });
+
+  // Serve vditor dependencies from local files
+  serveVditorFile('/dist/js/mathjax/tex-svg-full.js', './vditor/js/mathjax/tex-svg-full.js');
+  serveVditorFile('/dist/js/graphviz/full.render.js', './vditor/js/graphviz/full.render.js');
+  serveVditorFile('/dist/js/graphviz/viz.js', './vditor/js/graphviz/viz.js');
+  serveVditorFile('/dist/js/mermaid/mermaid.min.js', './vditor/js/mermaid/mermaid.min.js');
+  serveVditorFile('/dist/js/echarts/echarts.min.js', './vditor/js/echarts/echarts.min.js');
+  serveVditorFile('/dist/js/flowchart.js/flowchart.min.js', './vditor/js/flowchart.js/flowchart.min.js');
+  serveVditorFile('/dist/js/abcjs/abcjs_basic.min.js', './vditor/js/abcjs/abcjs_basic.min.js');
+  serveVditorFile('/dist/js/highlight.js/highlight.min.js', './vditor/js/highlight.js/highlight.min.js');
+  serveVditorFile('/dist/js/highlight.js/third-languages.js', './vditor/js/highlight.js/third-languages.js');
+  serveVditorFile('/dist/js/highlight.js/styles/github.min.css', './vditor/js/highlight.js/styles/github.min.css');
+  serveVditorFile('/dist/js/highlight.js/styles/github-dark.min.css', './vditor/js/highlight.js/styles/github-dark.min.css');
+  serveVditorFile('/dist/js/plantuml/plantuml-encoder.min.js', './vditor/js/plantuml/plantuml-encoder.min.js');
+  serveVditorFile('/dist/js/markmap/markmap.min.js', './vditor/js/markmap/markmap.min.js');
+  serveVditorFile('/dist/js/smiles-drawer/smiles-drawer.min.js', './vditor/js/smiles-drawer/smiles-drawer.min.js');
+  serveVditorFile('/dist/js/katex/katex.min.js', './vditor/js/katex/katex.min.js');
+  serveVditorFile('/dist/js/katex/mhchem.min.js', './vditor/js/katex/mhchem.min.js');
+  app.use('/plugins', pluginRouter);
+
+  // Other API endpoints
+  app.use('/api/rss', rssRouter);
+  app.use('/v1', openaiRouter);
+
+  // OpenAPI documentation endpoints
+  app.get('/api/openapi.json', (req, res) => {
+    res.json(openApiDocument);
+  });
+
+  // Swagger UI configuration
+  app.use('/api-doc', swaggerUi.serve, swaggerUi.setup(openApiDocument, {
+    customCss: '.swagger-ui .topbar { display: none }',
+    customSiteTitle: 'PlanInc API Document',
+    customfavIcon: '/favicon.png',
+    swaggerOptions: {
+      persistAuthorization: true,
+      docExpansion: 'list',
+      filter: true
+    }
+  }));
+
+  // OpenAPI integration
+  app.use('/api',
+    // @ts-ignore
+    createOpenApiExpressMiddleware({
+      router: appRouter,
+      createContext: ({ req, res }: { req: express.Request; res: express.Response }) => {
+        return createContext(req, res);
+      }
+    })
+  );
+  
+  // Health check endpoint
+  app.get('/health', (req, res) => {
+    res.json({ status: 'ok' });
+  });
+
+
+  app.use('/', mcpRouter);
+}
+
+/**
+ * Upsert superadmin from PLANINC_SUPERUSER_NAME / PLANINC_SUPERUSER_PASSWORD.
+ * First-run behaviour (native `make run` and Docker `make deploy/up` share it):
+ * - env username+password set (12+ chars) -> create/update that account.
+ * - no superadmin exists and env is missing -> generate a shell-safe password
+ *   for `PLANINC_SUPERUSER_NAME || 'admin'`, create the account, and write
+ *   `./data/superuser.txt` (container: `/app/data/superuser.txt`) with 0600.
+ * - a superadmin already exists and env is missing -> do nothing.
+ */
+function generateShellSafePassword(length = 32): string {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const bytes = crypto.randomBytes(length);
+  let out = '';
+  for (let i = 0; i < length; i++) {
+    out += alphabet[bytes[i]! % alphabet.length];
+  }
+  return out;
+}
+
+function resolveSuperuserTxtPath(): string {
+  const dbFile = process.env.PLANINC_DB_FILE || './data/planinc.db';
+  const dir = path.isAbsolute(dbFile)
+    ? path.dirname(dbFile)
+    : path.resolve(process.cwd(), path.dirname(dbFile));
+  return path.join(dir, 'superuser.txt');
+}
+
+function writeSuperuserTxt(username: string, password: string, generated: boolean): void {
+  try {
+    const txtPath = resolveSuperuserTxtPath();
+    fs.mkdirSync(path.dirname(txtPath), { recursive: true });
+    const lines = [
+      '# PlanInc superuser — created on first boot',
+      `# Generated: ${new Date().toISOString()} (generated: ${generated ? 'yes' : 'no'})`,
+      `username: ${username}`,
+      `password: ${password}`,
+      '',
+      'Sign in at http://localhost:1111/signin or https://notes.structa.cloud/signin',
+      'Save this password in a manager, then delete this file.',
+      'This file is gitignored (data/superuser.txt) and chmod 0600.',
+      '',
+    ];
+    fs.writeFileSync(txtPath, lines.join('\n'), { mode: 0o600 });
+    try {
+      fs.chmodSync(txtPath, 0o600);
+    } catch {
+      // non-POSIX FS — content is written, mode is best-effort
+    }
+    console.log(`[superuser] Wrote ${txtPath} (0600). Delete after saving.`);
+  } catch (error) {
+    console.error('[superuser] failed to write superuser.txt:', error);
+  }
+}
+
+async function bootstrapSuperuserFromEnv(): Promise<void> {
+  const envUsername = (process.env.PLANINC_SUPERUSER_NAME ?? '').trim();
+  const envSecret = (process.env.PLANINC_SUPERUSER_PASSWORD ?? '').trim();
+  try {
+    const { db } = await import('./db');
+    const existingNamed = envUsername
+      ? await db.accounts.findFirst({ where: { name: envUsername } })
+      : null;
+    const existingSuperadmin = await db.accounts.findFirst({ where: { role: 'superadmin' } });
+
+    // Explicit env credentials win (existing behaviour: upsert + re-hash).
+    if (envUsername && envSecret) {
+      if (envSecret.length < 12) {
+        console.warn('[superuser] PLANINC_SUPERUSER_PASSWORD must be at least 12 characters; skipping');
+        return;
+      }
+      const passwordHash = await hashPassword(envSecret);
+      const data = {
+        name: envUsername,
+        nickname: envUsername,
+        password: passwordHash,
+        role: 'superadmin' as const,
+        loginType: '',
+        image: existingNamed?.image ?? '',
+        apiToken: existingNamed?.apiToken ?? '',
+        note: existingNamed?.note ?? 0,
+        description: existingNamed?.description ?? null,
+        linkAccountId: existingNamed?.linkAccountId ?? null,
+      };
+      if (existingNamed) {
+        await db.accounts.update({ where: { id: existingNamed.id }, data });
+        console.log(`[superuser] Updated superuser "${envUsername}" from environment (id ${existingNamed.id}).`);
+      } else {
+        const created = await db.accounts.create({ data });
+        console.log(`[superuser] Bootstrapped superuser "${envUsername}" from environment (id ${created.id}).`);
+      }
+      // First boot only: leave a local credential note next to the DB file.
+      if (!existingSuperadmin && !existingNamed) {
+        writeSuperuserTxt(envUsername, envSecret, false);
+      }
+      return;
+    }
+
+    // First run without env: generate once, only when no superadmin exists.
+    if (existingSuperadmin) return;
+    const username = envUsername || 'admin';
+    const secret = generateShellSafePassword(32);
+    const passwordHash = await hashPassword(secret);
+    const created = await db.accounts.create({
+      data: {
+        name: username,
+        nickname: username,
+        password: passwordHash,
+        role: 'superadmin' as const,
+        loginType: '',
+        image: '',
+        apiToken: '',
+        note: 0,
+        description: null,
+        linkAccountId: null,
+      },
+    });
+    console.log(`[superuser] Bootstrapped superuser "${username}" with generated password (id ${created.id}).`);
+    writeSuperuserTxt(username, secret, true);
+  } catch (error) {
+    console.error('[superuser] env bootstrap failed:', error);
+  }
+}
+
+/**
+ * Bootstrap the server
+ * Sets up middleware, auth, API routes and starts the server
+ */
+async function bootstrap() {
+  try {
+    // Schema + welcome notes must exist before any request. `seed.ts` is not
+    // part of the production bundle (container only runs `node server/index.js`),
+    // so apply the idempotent schema helpers here instead of relying on a
+    // separate seed process that never runs.
+    try {
+      await ensureSurrealSchema();
+      const { db } = await import('./db');
+      await bootstrapSuperuserFromEnv();
+      const accounts = await db.accounts.findMany({ orderBy: { id: 'asc' } });
+      for (const account of accounts) {
+        await createSeed(Number(account.id));
+      }
+    } catch (seedErr) {
+      console.error('schema/seed bootstrap failed (continuing):', seedErr);
+    }
+
+    app.use(cors({
+      origin: (origin, callback) => {
+        // Same-origin browser requests do not include an Origin header.
+        if (!origin || corsOrigins.has(origin) || isDevelopmentLoopbackOrigin(origin)) {
+          callback(null, true);
+          return;
+        }
+
+        // Let the browser enforce the policy without turning a normal
+        // cross-origin request into an application error response.
+        callback(null, false);
+      },
+      credentials: true
+    }));
+
+    if (process.env.TRUST_PROXY === '1') {
+      app.set('trust proxy', 1);
+    }
+
+    const staticOptions = {
+      maxAge: '7d',
+      immutable: true,
+      setHeaders: (res: express.Response, path: string) => {
+        const ext = path.split('.').pop()?.toLowerCase();
+        if (['png', 'webp', 'svg', 'json', 'ico', 'gif', 'mp4'].includes(ext || '')) {
+          res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
+          res.setHeader('Expires', new Date(Date.now() + 604800000).toUTCString());
+        }
+      }
+    };
+
+    const publicPath = path.resolve(appRootProd, 'public');
+    app.use(express.static(publicPath, staticOptions));
+
+    // Add body parsers for JSON and form data
+    app.use(express.json({ limit: '50mb' }));
+    app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+    await configureSession(app);
+
+    // Setup API routes
+    await setupApiRoutes(app);
+    //@ts-ignore
+    app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+      errorHandler(err, req, res, next);
+    });
+
+    // Initialize scheduled jobs
+    await initializeJobs();
+
+    // Start or update server
+    if (!server) {
+      const server = app.listen(PORT, "0.0.0.0", () => {
+        console.log(`🎉server start on port http://0.0.0.0:${PORT} - env: ${process.env.NODE_ENV || 'development'}`);
+      });
+      
+      // Increase timeout for large file uploads (5 minutes)
+      server.timeout = 5 * 60 * 1000;
+      server.keepAliveTimeout = 5 * 60 * 1000;
+      server.headersTimeout = 5 * 60 * 1000;
+      
+      ViteExpress.bind(app, server); // the server binds to all network interfaces
+    } else {
+      console.log(`API routes updated - env: ${process.env.NODE_ENV || 'development'}`);
+    }
+  } catch (err) {
+    console.error('start server error:', err);
+    try {
+      // Attempt to start server even if route setup fails
+      if (!server) {
+        const server = app.listen(PORT, "0.0.0.0", () => {
+          console.log(`🎉server start on port http://0.0.0.0:${PORT} - env: ${process.env.NODE_ENV || 'development'}`);
+        });
+        ViteExpress.bind(app, server); // the server binds to all network interfaces
+      }
+    } catch (startupError) {
+      console.error('start server error:', startupError);
+    }
+  }
+}
+
+// Start the server
+bootstrap(); 
